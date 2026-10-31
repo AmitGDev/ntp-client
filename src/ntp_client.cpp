@@ -25,20 +25,24 @@
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
-// NOLINTNEXTLINE(misc-include-cleaner, llvm-include-order)
+// NOLINTNEXTLINE(misc-include-cleaner)
 #include <Windows.h>  // Must be included after Winsock2.h
+#include <bcrypt.h>   // Requires Windows base type declarations
 
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <utility>
 
 #pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "Bcrypt.lib")
 
 namespace amitgdev::network {
 
@@ -52,7 +56,10 @@ constexpr auto kDefaultTimeout = 5s;
 constexpr size_t kMaxHostnameLength = 253;
 
 // NTP Protocol constants
-constexpr uint8_t kDefaultVersion = 3;
+constexpr uint8_t kNtpVersion = 4;  // RFC 5905
+// Servers echo the request version, but some legacy servers answer a v4 request
+// with v3. The 48-byte header is identical, so both are safe to accept.
+constexpr uint8_t kMinAcceptedVersion = 3;
 constexpr uint8_t kClientMode = 3;
 constexpr uint8_t kServerMode = 4;
 constexpr uint8_t kAlarmCondition = 3;
@@ -100,6 +107,10 @@ constexpr uint8_t kModeInvMask = 0xF8;
       return "Receive failed";
     case NtpError::kInvalidResponse:
       return "Invalid response";
+    case NtpError::kConnectFailed:
+      return "Failed to connect UDP socket to server";
+    case NtpError::kRandomFailed:
+      return "Failed to generate request nonce";
     default:
       return "Unknown error";
   }
@@ -126,6 +137,42 @@ class Timestamp final {
   uint32_t seconds_{0};   // Seconds since Jan 1, 1900.
   uint32_t fraction_{0};  // Fractional part of seconds.
 
+  // Used to match a reply's origin timestamp against our request nonce.
+  constexpr bool operator==(const Timestamp&) const noexcept = default;
+
+  // Returns a cryptographically random, non-zero timestamp to use as the
+  // request's transmit timestamp.
+  //
+  // The client does not need its real clock in the request: the server copies
+  // the transmit timestamp into the origin field of its reply, so an
+  // unpredictable value acts as a nonce that makes off-path response spoofing
+  // harder (RFC 5905, Section 8). It also avoids disclosing the client's
+  // local clock to the server.
+  [[nodiscard]] static std::optional<Timestamp> MakeRandom() noexcept {
+    std::array<uint32_t, 2> words{};
+
+    // NOLINTNEXTLINE(misc-include-cleaner)
+    const NTSTATUS status = BCryptGenRandom(
+        nullptr, reinterpret_cast<uint8_t*>(words.data()),
+        static_cast<uint32_t>(sizeof(words)), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+
+    if (!BCRYPT_SUCCESS(status)) {
+      return std::nullopt;
+    }
+
+    Timestamp result{};
+    result.seconds_ = words.at(0);
+    result.fraction_ = words.at(1);
+
+    // An all-zero transmit timestamp means "not set" in NTP, and the reply
+    // validation rejects it, so never produce it.
+    if (result.Zero()) {
+      result.fraction_ = 1;
+    }
+
+    return result;
+  }
+
   // Swap the timestamp fields between Network Byte Order
   // (Big-Endian) and the Host's Native Byte Order. If the
   // Native Byte Order is Big-Endian (like Network Byte Order),
@@ -151,7 +198,10 @@ class NtpMessage final {
  public:
   //
   // The NTP packet header format, depicted in Figure 8 of RFC 5905, is as
-  // follows:
+  // follows. NTPv3 and NTPv4 share the same 48-byte header; only the VN field
+  // differs. This client sends and expects the bare header: the extension
+  // fields and the MAC (Key Identifier + digest) below are never requested, so
+  // a conforming server doesn't add them to its reply.
   //
   //       0                   1                   2                   3
   //       0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -195,7 +245,7 @@ class NtpMessage final {
   //      |                          Key Identifier                       |
   //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
   //      |                                                               |
-  //      |                            dgst (128)                          |
+  //      |                            dgst (128)                         |
   //      |                                                               |
   //      +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
   //
@@ -206,9 +256,9 @@ class NtpMessage final {
   uint8_t poll_{0};
   uint8_t precision_{0};
 
-  uint32_t sync_distance_{0};
-  uint32_t drift_rate_{0};
-  uint8_t ref_clock_id_[4]{0};
+  uint32_t root_delay_{0};
+  uint32_t root_dispersion_{0};
+  uint8_t reference_id_[4]{0};
 
   Timestamp ref_{};
   Timestamp orig_{};
@@ -223,13 +273,11 @@ class NtpMessage final {
     rx_.SwapEndiansIfNLE();    // Receive Timestamp (64)
     tx_.SwapEndiansIfNLE();    // Transmit Timestamp (64)
 
-    // Swap also these fields between Network Byte Order
-    // (Big-Endian) and the Host's Native Byte Order. If the
-    // Native Byte Order is Big-Endian (like Network Byte Order),
-    // no operation is performed, as the formats already match.
+    // Root Delay and Root Dispersion are multi-byte fields too. Reference ID
+    // is deliberately left alone: it is an opaque byte string, not a number.
     if constexpr (std::endian::native == std::endian::little) {
-      sync_distance_ = std::byteswap(sync_distance_);
-      drift_rate_ = std::byteswap(drift_rate_);
+      root_delay_ = std::byteswap(root_delay_);
+      root_dispersion_ = std::byteswap(root_dispersion_);
     }
   }
 
@@ -248,7 +296,7 @@ class NtpMessage final {
     return li_vn_mode_ & kModeMask;
   }
 
-  // Sets the Version (e.g., 3 or 4).
+  // Sets the Version (3 or 4; this client sends 4).
   void SetVersion(const uint8_t version) noexcept {
     li_vn_mode_ = static_cast<uint8_t>(
         (static_cast<unsigned int>(li_vn_mode_) & kVersionInvMask) |
@@ -274,14 +322,25 @@ class NtpMessage final {
     return (static_cast<uint8_t>(li_vn_mode_ >> kLeapShift)) & kLeapMask;
   }
 
-  // Validates the NTP response message
-  [[nodiscard]] bool IsValid() const noexcept {
-    return Mode() == kServerMode && LeapIndicator() != kAlarmCondition &&
-           stratum_ > 0 && stratum_ <= kMaxValidStratum && !tx_.Zero();
+  // Validates the NTP response message against the request that triggered it.
+  //
+  // `request_tx` is the transmit timestamp we sent. A genuine server copies it
+  // into the origin field, so a mismatch means the packet is a spoof, a replay
+  // or a late reply to an earlier request. Stratum 0 (Kiss-o'-Death) and
+  // unsynchronized servers (LI=3) are rejected as they carry no usable time.
+  [[nodiscard]] bool IsValid(const Timestamp& request_tx) const noexcept {
+    const auto version = Version();
+
+    return Mode() == kServerMode && version >= kMinAcceptedVersion &&
+           version <= kNtpVersion && LeapIndicator() != kAlarmCondition &&
+           stratum_ > 0 && stratum_ <= kMaxValidStratum &&
+           orig_ == request_tx && !tx_.Zero();
   }
 
   // Receives the NTP message from the given socket
   // and returns the number of bytes received or an error code.
+  // The socket must be connect()ed to the server so the OS drops datagrams
+  // from any other source.
   [[nodiscard]] std::expected<int, std::error_code>
   Receive(const SOCKET socket) noexcept {
     const auto received_count = recv(socket, reinterpret_cast<char*>(this),
@@ -302,20 +361,19 @@ class NtpMessage final {
     return received_count;
   }
 
-  // Sends the NTP message to the given socket and server address
+  // Sends the NTP message on the given connected socket
   // and returns the number of bytes sent or an error code.
   [[nodiscard]] std::expected<int, std::error_code>
-  SendTo(const SOCKET socket, const sockaddr_in& server_addr) noexcept {
+  Send(const SOCKET socket) const noexcept {
+    // Work on a copy so this object keeps host byte order for later use.
     NtpMessage network_msg = *this;
 
     // Host Native Byte Order -> Network Byte Order (before send)
     network_msg.SwapEndiansIfNLE();
 
     const auto sent_count =
-        sendto(socket, reinterpret_cast<const char*>(&network_msg),
-               static_cast<int>(sizeof(network_msg)), 0,
-               reinterpret_cast<const sockaddr*>(&server_addr),
-               static_cast<int>(sizeof(server_addr)));
+        send(socket, reinterpret_cast<const char*>(&network_msg),
+             static_cast<int>(sizeof(network_msg)), 0);
 
     if (sent_count == SOCKET_ERROR) {
       return std::unexpected{
@@ -383,6 +441,14 @@ class Socket final {
     return recv_result != SOCKET_ERROR && send_result != SOCKET_ERROR;
   }
 
+  // Associates the UDP socket with a single peer. No handshake happens; the
+  // point is that the OS then discards inbound datagrams from any other
+  // address or port, so only the queried server can answer us.
+  [[nodiscard]] bool Connect(const sockaddr_in& server_addr) const noexcept {
+    return connect(socket_, reinterpret_cast<const sockaddr*>(&server_addr),
+                   static_cast<int>(sizeof(server_addr))) != SOCKET_ERROR;
+  }
+
  private:
   SOCKET socket_;
 };
@@ -435,10 +501,17 @@ GetNtpTimestamp(const std::string& hostname) noexcept {
     return std::unexpected{MakeErrorCode(NtpError::kWsaInitFailed)};
   }
 
+  // The random transmit timestamp doubles as the nonce the server must echo.
+  const auto request_nonce = Timestamp::MakeRandom();
+  if (!request_nonce) {
+    return std::unexpected{MakeErrorCode(NtpError::kRandomFailed)};
+  }
+
   // Prepare NTP request message
   NtpMessage ntp_message{};
-  ntp_message.SetVersion(kDefaultVersion);
+  ntp_message.SetVersion(kNtpVersion);
   ntp_message.SetMode(kClientMode);
+  ntp_message.tx_ = *request_nonce;
 
   const addrinfo hints{
       .ai_flags = 0,
@@ -481,9 +554,14 @@ GetNtpTimestamp(const std::string& hostname) noexcept {
     return std::unexpected{MakeErrorCode(NtpError::kTimeoutFailed)};
   }
 
+  // Restrict the socket to the server so spoofed datagrams from other sources
+  // never reach recv().
+  if (!udp_socket.Connect(*server_addr)) {
+    return std::unexpected{MakeErrorCode(NtpError::kConnectFailed)};
+  }
+
   // Send NTP request
-  if (const auto send_result =
-          ntp_message.SendTo(udp_socket.Get(), *server_addr);
+  if (const auto send_result = ntp_message.Send(udp_socket.Get());
       !send_result) {
     return std::unexpected{MakeErrorCode(NtpError::kSendFailed)};
   }
@@ -495,8 +573,8 @@ GetNtpTimestamp(const std::string& hostname) noexcept {
     return std::unexpected{MakeErrorCode(NtpError::kReceiveFailed)};
   }
 
-  // Validate NTP response
-  if (!response.IsValid()) {
+  // Validate NTP response, including that it answers this very request
+  if (!response.IsValid(*request_nonce)) {
     return std::unexpected{MakeErrorCode(NtpError::kInvalidResponse)};
   }
 

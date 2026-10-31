@@ -31,13 +31,17 @@
 
 namespace amitgdev::network {
 
-// Holds the NTP timestamp (seconds since Jan 1, 1900)
+// Holds the NTP timestamp (seconds since Jan 1, 1900, NTP era 0).
+// Unsigned 32-bit seconds wrap in Feb 2036; callers that must work past that
+// date need to resolve the era themselves (RFC 5905, section 6).
 struct NtpTimestamp {
   uint32_t seconds;
   uint32_t fraction;
 };
 
-// Error codes for NTP operations
+// Error codes for NTP operations.
+// New values are appended at the end to keep existing numeric values stable
+// for callers that persist or compare raw error codes.
 enum class NtpError : std::uint8_t {
   kSuccess = 0,           // Everything worked
   kWsaInitFailed,         // WSAStartup failed
@@ -45,9 +49,12 @@ enum class NtpError : std::uint8_t {
   kHostResolutionFailed,  // DNS resolution failed
   kSocketCreationFailed,  // socket() failed
   kTimeoutFailed,         // setsockopt(SO_RCVTIMEO/SO_SNDTIMEO) failed
-  kSendFailed,            // sendto() failed
-  kReceiveFailed,         // recvfrom() failed
-  kInvalidResponse,       // response didn't parse/validate
+  kSendFailed,            // send() failed
+  kReceiveFailed,         // recv() failed
+  kInvalidResponse,       // response didn't parse/validate (this includes an
+                          // origin timestamp that doesn't echo our request)
+  kConnectFailed,         // connect() on the UDP socket failed
+  kRandomFailed,          // OS random generator failed (request nonce)
 };
 
 // Error category for NTP errors
@@ -62,7 +69,11 @@ const ErrorCategory& GetErrorCategory() noexcept;
 // Create an error code from NtpError
 std::error_code MakeErrorCode(NtpError ntp_error) noexcept;
 
-// Main API
+// Main API.
+// Performs a single NTPv4 (RFC 5905) client request against `hostname` and
+// returns the server's transmit timestamp. The reply is accepted only if it
+// comes from the queried server and echoes this request's random nonce, so
+// off-path spoofed replies are rejected. No offset/delay correction is applied.
 std::expected<NtpTimestamp, std::error_code>
 GetNtpTimestamp(const std::string& hostname) noexcept;
 
